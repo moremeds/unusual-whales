@@ -18,13 +18,15 @@ Phase 1a (MVP)        Flow → Score → Discord → Log
                       1 endpoint, 2 tables, single LLM provider, webhook
 
 Phase 1b (Harden)     + retry queue, failover, circuit breaker,
-                        clustering, health heartbeat, structured logs
+                        clustering, health heartbeat, structured logs,
+                        minimal backtester (signal_outcomes + nightly fill)
 
 Phase 1c (Enrich)     + earnings, market tide, IV rank, calendars,
                         max pain, dark pool, Tier 3 watchlist
 
 Phase 2a (Alpha)      + congress trading, insiders, GEX, seasonality,
-                        backtester, prompt versioning, Discord bot
+                        full backtester analytics, prompt versioning,
+                        Discord bot
 
 Phase 2b (Scale)      + WebSocket ($375/mo), MCP server, APEX adapter,
                         options P&L tracking
@@ -231,7 +233,7 @@ ops:
 | open_interest | INTEGER | Open interest |
 | raw_json | JSON | Full UW API response for replay |
 
-**Indexes:** `UNIQUE (uw_event_id)`, `(ticker, tape_time)`
+**Indexes:** `UNIQUE (uw_event_id)`, `(ticker, tape_time)`, `(ingested_at)`
 
 ### signal_scores
 | Column | Type | Description |
@@ -247,10 +249,33 @@ ops:
 | reasoning | TEXT | LLM rationale |
 | raw_output | JSON | Full structured LLM response |
 | alert_key | VARCHAR | hash(flow_event_id + tier + prompt_version) |
-| alert_sent | BOOLEAN | Whether Discord alert was delivered |
+| alert_status | VARCHAR | pending / sent / failed / skipped |
 | created_at | TIMESTAMPTZ | Score timestamp |
 
-**Indexes:** `(tier, score)`, `(flow_event_id)`, `UNIQUE (alert_key)`
+**Indexes:** `(tier, score)`, `(flow_event_id)`, `UNIQUE (alert_key)`, `(alert_status, created_at)`
+
+## Startup Validation
+
+All required secrets and config are validated at process start via Pydantic settings. If any required env var is missing or malformed, the process exits immediately with a clear error — never silently fails on first API call during market hours.
+
+**Validated at startup:**
+- `UW_API_KEY` — non-empty string
+- `ANTHROPIC_API_KEY` — non-empty string
+- `DISCORD_WEBHOOK_URL` — valid URL format
+- `config.yaml` — parseable, all required fields present
+- DuckDB path — parent directory exists and is writable
+
+## Spend Cap Enforcement
+
+The `daily_spend_cap_usd` config value is enforced by a `SpendTracker` that:
+1. Accumulates token usage from Anthropic API response metadata (`usage.input_tokens`, `usage.output_tokens`)
+2. Converts to USD using configured per-token rates (updated when model pricing changes)
+3. When cap is reached: skip Tier 2 scoring (continue Tier 1 with warning log), send a one-time Discord alert about budget exhaustion
+4. Resets at midnight UTC
+
+## DuckDB Concurrency
+
+All DuckDB access is wrapped in `asyncio.to_thread()` to avoid blocking the event loop. Single connection per process — DuckDB is single-writer, so all writes are serialized. In Phase 2a, the backtester runs as a separate process after market close (not concurrent with the live scanner).
 
 ## Project Structure (MVP)
 
@@ -336,6 +361,7 @@ uw-flow-scanner/
 - Group events by `(ticker, 5-min window)` before scoring.
 - Detects split orders that appear as multiple events.
 - Scores the cluster, not individual events.
+- **Ordering with cooldown:** events arrive → cluster by (ticker, 5-min window) → check cooldown on cluster's ticker → score if not in cooldown. Cooldown timer starts from when the last alert was *sent*, not from event arrival.
 
 ### Circuit Breaker
 - UW API: pause 5 min after 5 consecutive failures.
@@ -371,10 +397,37 @@ Add `poll_log` table:
 | status | VARCHAR | success / partial / failed |
 | events_fetched | INTEGER | Total from API |
 | events_new | INTEGER | After dedup |
-| high_water_mark | VARCHAR | Last event ID |
+| high_water_mark | TIMESTAMPTZ | Last seen tape_time (watermark for overlap window) |
 | uw_daily_count | INTEGER | From response header |
 | uw_minute_remaining | INTEGER | From response header |
 | error | TEXT | Error if any |
+
+### Minimal Backtester (Accuracy Baseline)
+
+A minimal backtester is introduced in Phase 1b to establish the accuracy baseline needed before Phase 1c enrichment and Phase 2a's full analytics.
+
+**`signal_outcomes` table:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| signal_id | UUID | FK to signal_scores |
+| ticker | VARCHAR | Symbol |
+| predicted_direction | VARCHAR | bullish / bearish / neutral (denormalized from signal_scores) |
+| entry_price | DECIMAL | Underlying price at signal time |
+| price_1d | DECIMAL | Price after 1 trading day |
+| price_5d | DECIMAL | Price after 5 trading days |
+| outcome | VARCHAR | win / loss / scratch |
+| updated_at | TIMESTAMPTZ | Last fill time |
+
+**Indexes:** `UNIQUE (signal_id)`, `(outcome)`
+
+**Nightly outcome filler:** After market close, fetches closing prices from UW API (`/stock/{T}/ohlc`) for signals 1 and 5 trading days old. Fills `price_1d`, `price_5d`, computes `outcome` using thresholds (win: ≥1% in predicted direction, scratch: ±0.5%, loss: ≥1% against).
+
+**Accuracy query:** Simple SQL query computes directional hit rate by tier and prompt version. No full analyzer yet — that comes in Phase 2a.
+
+### Cooldown Recovery on Restart
+
+On startup, derive cooldown state from `signal_scores.created_at` — query the last alert time per ticker to restore cooldowns without a separate table.
 
 ### Updated Config Additions
 
@@ -393,6 +446,10 @@ resilience:
 
 scoring:
   flow_cluster_window_seconds: 300
+
+backtest:
+  win_threshold_pct: 1.0
+  scratch_band_pct: 0.5
 ```
 
 ### Updated Dependencies
@@ -409,6 +466,8 @@ scoring:
 3. Poll log shows ≥99% successful polls during market hours
 4. Heartbeat messages appear in Discord at open/close
 5. Structured logs capture every error with context
+6. After 1 week, `signal_outcomes` table has price fills and directional accuracy is measurable
+7. Cooldown state restored correctly after process restart
 
 ---
 
@@ -433,6 +492,8 @@ Inject contextual data into LLM prompts to improve scoring quality. Each enrichm
 | `GET /darkpool/{ticker}` | On-demand (Tier 3) | 5 min | Dark pool conviction signal |
 
 **API budget impact:** ~1,500-2,000 additional calls/day → total ~4,000-5,000/day (well within 15K).
+
+**Rate limit priority:** When approaching limits (tracked via `x-uw-req-per-minute-remaining`), enrichment calls are deferred or skipped in priority order: flow-alerts polling (highest — never skip) > market tide > earnings > IV rank / max pain / dark pool (lowest — skip first). A burst of 20 high-scoring events in one cycle could trigger 60+ enrichment calls — the rate limiter throttles these to stay within 120 rpm.
 
 ## Enrichment Integration
 
@@ -489,6 +550,8 @@ class ContextCache:
     # darkpool: ticker → {prints, total_volume, conviction} — TTL 5min
 ```
 
+**Startup pre-warming:** On process start (before first scoring cycle), pre-fetch all long-TTL data (earnings for watchlist tickers, economic calendar, FDA calendar). This avoids a burst of API calls on the first poll cycle and ensures enrichment is available immediately.
+
 ### Updated Project Structure
 
 ```
@@ -519,8 +582,8 @@ src/
 |------|----------------|
 | UW API calls (+1,500/day) | $0 (same $150/mo tier) |
 | Tier 3 Sonnet (~420 events/mo) | ~$4/mo |
-| Enriched Tier 1 prompts (larger input) | ~$1/mo |
-| **Phase 1c total** | **~$162/mo** |
+| Enriched Tier 1 prompts (larger input, ~2x tokens) | ~$3/mo |
+| **Phase 1c total** | **~$164/mo** |
 
 ### Phase 1c Success Criteria
 
@@ -534,7 +597,7 @@ src/
 
 # Phase 2a: Unique Alpha Signals
 
-**Trigger:** Phase 1c runs profitably for 2+ weeks. Backtester confirms positive directional accuracy.
+**Trigger:** Phase 1c runs for 2+ weeks. Phase 1b backtester shows positive directional accuracy (>50% hit rate on Tier 2 signals).
 
 ## New Signal Sources
 
@@ -552,7 +615,7 @@ Congressional trades are rare (~5-15/day), high-signal, and unique to UW. They b
 **Routing:**
 - Congress trade on a watchlist ticker → Tier 3 (always)
 - Congress trade on any other ticker → Tier 2 (score it)
-- Dedup by disclosure date + ticker + politician (no UUID from API)
+- Dedup by disclosure date + ticker + politician + transaction_type + amount_range (no UUID from API)
 
 **Discord:** Separate embed style with politician name, party, trade type (buy/sell), amount range, and ticker.
 
@@ -577,30 +640,28 @@ Congressional trades are rare (~5-15/day), high-signal, and unique to UW. They b
 **Use:** Tier 2/3 enrichment. Cheap one-liner.
 **Prompt injection:** `"SEASONALITY: SPY historically +2.3% in March (78% win rate over 20 years)"`
 
-## Backtester
+## Full Backtester Analytics
 
-Re-introduce from original design. Runs after market close.
+Expand the Phase 1b minimal backtester into a comprehensive analysis tool.
 
-### signal_outcomes table
+### signal_outcomes table (expanded from Phase 1b)
+
+Add columns to the existing `signal_outcomes` table:
 
 | Column | Type | Description |
 |--------|------|-------------|
-| signal_id | UUID | FK to signal_scores |
-| ticker | VARCHAR | Symbol |
-| entry_price | DECIMAL | Price at signal time |
-| price_1d | DECIMAL | Price after 1 trading day |
-| price_3d | DECIMAL | Price after 3 trading days |
-| price_5d | DECIMAL | Price after 5 trading days |
-| price_10d | DECIMAL | Price after 10 trading days |
-| max_favorable | DECIMAL | Best price in window |
-| max_adverse | DECIMAL | Worst price in window |
-| outcome | VARCHAR | win / loss / scratch |
-| updated_at | TIMESTAMPTZ | Last fill time |
+| price_3d | DECIMAL | Price after 3 trading days (new) |
+| price_10d | DECIMAL | Price after 10 trading days (new) |
+| max_favorable | DECIMAL | Best price in evaluation window (new) |
+| max_adverse | DECIMAL | Worst price in evaluation window (new) |
 
-**Win/loss thresholds:**
-- Win: underlying moves ≥ 1% in predicted direction
-- Scratch: within ±0.5%
-- Loss: moves ≥ 1% against predicted direction
+### Backtester Analyzer
+
+Full analyzer (separate process, runs after market close):
+- Directional accuracy by tier, prompt version, ticker, and time period
+- Score calibration curves (do higher scores predict better outcomes?)
+- Prompt version comparison (A/B testing across prompt versions)
+- Excludes time windows with failed/partial polls (from `poll_log`)
 
 ### Prompt Version Registry
 
@@ -727,8 +788,8 @@ Upgrade from directional accuracy to true options P&L:
 | Item | Cost Change |
 |------|-------------|
 | UW Advanced tier | $375/mo (was $150) |
-| Reduced LLM retry (better data) | -$2/mo |
-| **Phase 2b total** | **~$388/mo** |
+| LLM costs (same as 2a) | ~$15/mo |
+| **Phase 2b total** | **~$390/mo** |
 
 ---
 
@@ -765,9 +826,9 @@ Upgrade from directional accuracy to true options P&L:
 |-------|--------|-----|-------|-------|
 | 1a | $150 | $7 | $0 | $157 |
 | 1b | $150 | $9 | $0 | $159 |
-| 1c | $150 | $12 | $0 | $162 |
+| 1c | $150 | $14 | $0 | $164 |
 | 2a | $150 | $15 | $0 | $165 |
-| 2b | $375 | $13 | $0 | $388 |
+| 2b | $375 | $15 | $0 | $390 |
 
 ## Operations
 
@@ -814,3 +875,23 @@ Upgrade from directional accuracy to true options P&L:
 | 13 | Flat `src/` structure in MVP | No premature directory nesting |
 | 14 | Added ContextCache (1c) | Efficient enrichment data management with TTLs |
 | 15 | Added seasonality endpoint (2a) | Cheap enrichment for Discord embeds |
+
+### Architect Review (Rev 2) — Issues Addressed
+
+| # | Issue | Severity | Fix |
+|---|-------|----------|-----|
+| 1 | Backtester in Phase 2a but needed to measure Phase 1c accuracy | Critical | Moved minimal backtester to Phase 1b |
+| 2 | `alert_sent` boolean insufficient for debugging | Major | Changed to `alert_status` VARCHAR enum |
+| 3 | No startup secret validation | Major | Added startup validation section |
+| 4 | Spend cap has no enforcement mechanism | Major | Added SpendTracker component |
+| 5 | DuckDB concurrency model unaddressed | Major | Added concurrency section (asyncio.to_thread) |
+| 6 | No rate limit handling for enrichment burst | Major | Added rate limit priority ordering in Phase 1c |
+| 7 | `poll_log.high_water_mark` type mismatch | Minor | Changed to TIMESTAMPTZ |
+| 8 | No index on `flow_events.ingested_at` | Minor | Added index |
+| 9 | `signal_outcomes` missing `predicted_direction` | Minor | Added denormalized column |
+| 10 | Cooldown vs. clustering interaction undefined | Minor | Documented ordering |
+| 11 | Congress trade dedup key too narrow | Minor | Added transaction_type + amount_range |
+| 12 | ContextCache needs pre-warming | Minor | Added startup pre-warming note |
+| 13 | Phase 1c enriched prompt cost underestimated | Minor | Revised to ~$3/mo |
+| 14 | Phase 2b LLM cost reduction unjustified | Minor | Removed false savings claim |
+| 15 | Cooldown state lost on restart | Minor | Added recovery from signal_scores on startup |
