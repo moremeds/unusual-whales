@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
-import duckdb
 import pytest
 
 from uw_flow_scanner.core.db import SignalDB

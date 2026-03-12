@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -72,7 +71,9 @@ async def test_scorer_tier1(mock_event: FlowEvent):
     """Tier 1 scoring returns Tier1Result via tool_use structured output."""
     mock_tool_block = MagicMock()
     mock_tool_block.type = "tool_use"
-    mock_tool_block.input = {"score": 82, "direction": "bullish", "reasoning": "Large premium sweep"}
+    mock_tool_block.input = {
+        "score": 82, "direction": "bullish", "reasoning": "Large premium sweep",
+    }
 
     mock_response = MagicMock()
     mock_response.content = [mock_tool_block]

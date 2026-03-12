@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date
 from decimal import Decimal
 
 import pytest
 
-from uw_flow_scanner.core.schemas import FlowEvent, Tier1Result, Tier2Result, parse_flow_event
+from uw_flow_scanner.core.schemas import Tier1Result, Tier2Result, parse_flow_event
 
 
 def test_parse_flow_event_from_api(sample_flow_event: dict):

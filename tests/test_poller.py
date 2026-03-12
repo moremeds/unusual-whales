@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 import respx
 
-from uw_flow_scanner.ingestion.poller import RateLimitState, UWPoller
 from uw_flow_scanner.core.schemas import FlowEvent
+from uw_flow_scanner.ingestion.poller import UWPoller
 
 
 @pytest.fixture

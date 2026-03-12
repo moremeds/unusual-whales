@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from decimal import Decimal
 
 import httpx
 import structlog
@@ -24,7 +23,10 @@ def build_embed(event: FlowEvent, result: Tier2Result) -> dict:
     color = COLORS.get(direction, 0x808080)
 
     return {
-        "title": f"{'🟢' if direction == 'bullish' else '🔴' if direction == 'bearish' else '🟡'} {event.ticker} — {direction.upper()} ({result.score}/100)",
+        "title": (
+            f"{'🟢' if direction == 'bullish' else '🔴' if direction == 'bearish' else '🟡'}"
+            f" {event.ticker} — {direction.upper()} ({result.score}/100)"
+        ),
         "color": color,
         "fields": [
             {"name": "Score", "value": str(result.score), "inline": True},
@@ -36,7 +38,11 @@ def build_embed(event: FlowEvent, result: Tier2Result) -> dict:
             {"name": "Strike", "value": f"${event.strike}", "inline": True},
             {"name": "Expiry", "value": str(event.expiry), "inline": True},
             {"name": "Underlying", "value": f"${event.underlying_price}", "inline": True},
-            {"name": "Vol / OI", "value": f"{event.volume:,} / {event.open_interest:,}", "inline": True},
+            {
+                "name": "Vol / OI",
+                "value": f"{event.volume:,} / {event.open_interest:,}",
+                "inline": True,
+            },
             {
                 "name": "Conviction Factors",
                 "value": "\n".join(f"• {f}" for f in result.conviction_factors) or "N/A",
@@ -44,7 +50,9 @@ def build_embed(event: FlowEvent, result: Tier2Result) -> dict:
             },
             {"name": "Reasoning", "value": result.reasoning[:1024], "inline": False},
         ],
-        "footer": {"text": f"UW Flow Scanner | {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"},
+        "footer": {
+            "text": f"UW Flow Scanner | {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}",
+        },
     }
 
 

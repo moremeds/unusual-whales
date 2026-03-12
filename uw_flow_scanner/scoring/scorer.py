@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import json
-from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from decimal import Decimal
 from typing import TypeVar
 
 import structlog
 from anthropic import AsyncAnthropic
 from pydantic import BaseModel
 
+from uw_flow_scanner.core.schemas import FlowEvent, Tier1Result, Tier2Result
 from uw_flow_scanner.scoring.prompts import (
     PROMPT_VERSION,
     TIER1_SYSTEM,
@@ -18,7 +16,6 @@ from uw_flow_scanner.scoring.prompts import (
     format_tier1_prompt,
     format_tier2_prompt,
 )
-from uw_flow_scanner.core.schemas import FlowEvent, Tier1Result, Tier2Result
 
 logger = structlog.get_logger()
 

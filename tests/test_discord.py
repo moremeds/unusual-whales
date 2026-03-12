@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
@@ -24,7 +23,10 @@ def tier2_result() -> Tier2Result:
         direction="bullish",
         confidence=0.85,
         conviction_factors=["$1.25M premium sweep", "5200 vol vs 12K OI", "OTM call"],
-        reasoning="Strong bullish conviction on AAPL with large premium sweep targeting $185 strike.",
+        reasoning=(
+            "Strong bullish conviction on AAPL with large premium sweep"
+            " targeting $185 strike."
+        ),
     )
 
 

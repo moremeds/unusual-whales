@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
 
-from uw_flow_scanner.core.config import AppConfig, load_config
+from uw_flow_scanner.core.config import load_config
 
 
 def test_load_config_from_yaml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
