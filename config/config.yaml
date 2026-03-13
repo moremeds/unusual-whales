@@ -1,0 +1,46 @@
+scheduler:
+  market_hours_only: true
+  poll_interval_seconds: 30
+
+scoring:
+  score_threshold: 75
+  tier1_concurrency: 10
+  tier1_timeout_seconds: 5
+  tier2_timeout_seconds: 30
+  alert_cooldown_seconds: 600
+
+models:
+  tier1:
+    provider: anthropic
+    model: claude-haiku-4-5
+  tier2:
+    provider: anthropic
+    model: claude-sonnet-4-6
+
+uw_api:
+  base_url: https://api.unusualwhales.com
+  rate_limit_rpm: 120
+  daily_limit: 15000
+  retry_max: 3
+  retry_backoff_base: 2
+
+health:
+  enabled: true
+  port: 8090
+
+storage:
+  db_path: data/signals.duckdb
+
+logging:
+  level: INFO
+  format: json
+
+ops:
+  daily_spend_cap_usd: 10.0
+  token_rates:
+    claude-haiku-4-5:
+      input_per_mtok: 0.25
+      output_per_mtok: 1.25
+    claude-sonnet-4-6:
+      input_per_mtok: 3.0
+      output_per_mtok: 15.0
