@@ -46,8 +46,6 @@ storage:
 logging:
   level: DEBUG
   format: console
-  file: /dev/null
-  rotation: 10MB
 ops:
   daily_spend_cap_usd: 10.0
   token_rates: {{}}

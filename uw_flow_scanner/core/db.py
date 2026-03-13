@@ -125,13 +125,13 @@ class SignalDB:
         confidence: float | None,
         reasoning: str,
         raw_output: dict[str, Any],
-    ) -> uuid.UUID:
+    ) -> uuid.UUID | None:
+        """Insert a signal score. Returns score_id if new, None if duplicate alert_key."""
         score_id = uuid.uuid4()
-        # FIX 1: alert_key uses uw_event_id (stable) not transient flow_event_id
         alert_key = _make_alert_key(uw_event_id, tier, prompt_version)
         now = datetime.now(timezone.utc)
 
-        self.con.execute(
+        rows = self.con.execute(
             """
             INSERT INTO signal_scores
             (id, uw_event_id, flow_event_id, tier, model_used, prompt_version, score,
@@ -139,6 +139,7 @@ class SignalDB:
              alert_status, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
             ON CONFLICT (alert_key) DO NOTHING
+            RETURNING id
             """,
             [
                 str(score_id),
@@ -155,7 +156,9 @@ class SignalDB:
                 alert_key,
                 now.isoformat(),
             ],
-        )
+        ).fetchall()
+        if not rows:
+            return None
         return score_id
 
     def update_alert_status(self, score_id: uuid.UUID, status: str) -> None:
@@ -203,7 +206,7 @@ class SignalDB:
         async with self._lock:
             return await asyncio.to_thread(self.insert_flow_event, event)
 
-    async def async_insert_signal_score(self, **kwargs: Any) -> uuid.UUID:
+    async def async_insert_signal_score(self, **kwargs: Any) -> uuid.UUID | None:
         async with self._lock:
             return await asyncio.to_thread(self.insert_signal_score, **kwargs)
 

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import httpx
 import structlog
@@ -15,17 +15,28 @@ logger = structlog.get_logger()
 # FIX 4: Maximum number of seen IDs to retain (LRU eviction, not set.clear())
 _MAX_SEEN_IDS = 2000
 
+# Stale rate-limit state thresholds (seconds)
+_MINUTE_STALENESS = 65  # minute limit resets every 60s
+_DAILY_STALENESS = 300  # daily limit — allow a probe every 5 min
+
 
 @dataclass
 class RateLimitState:
     daily_count: int = 0
     minute_remaining: int = 120
+    last_updated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def update_from_headers(self, headers: httpx.Headers) -> None:
         if "x-uw-daily-req-count" in headers:
             self.daily_count = int(headers["x-uw-daily-req-count"])
         if "x-uw-req-per-minute-remaining" in headers:
             self.minute_remaining = int(headers["x-uw-req-per-minute-remaining"])
+        self.last_updated = datetime.now(timezone.utc)
+
+    def is_stale(self, staleness_seconds: float) -> bool:
+        """True if rate-limit state hasn't been refreshed recently."""
+        elapsed = (datetime.now(timezone.utc) - self.last_updated).total_seconds()
+        return elapsed >= staleness_seconds
 
 
 class UWPoller:
@@ -61,14 +72,19 @@ class UWPoller:
 
     async def poll(self) -> list[FlowEvent]:
         """Poll flow-alerts endpoint. Returns new (deduplicated) events."""
-        # FIX 9: Skip if rate limits are nearly exhausted
-        if self.rate_state.minute_remaining < 5:
+        # Skip if rate limits are nearly exhausted (unless state is stale)
+        if self.rate_state.minute_remaining < 5 and not self.rate_state.is_stale(
+            _MINUTE_STALENESS
+        ):
             logger.warning(
                 "Rate limit nearly exhausted, skipping poll",
                 minute_remaining=self.rate_state.minute_remaining,
             )
             return []
-        if self.rate_state.daily_count >= self.daily_limit:
+        if (
+            self.rate_state.daily_count >= self.daily_limit
+            and not self.rate_state.is_stale(_DAILY_STALENESS)
+        ):
             logger.warning(
                 "Daily request limit reached, skipping poll",
                 daily_count=self.rate_state.daily_count,
@@ -79,7 +95,6 @@ class UWPoller:
         client = await self._get_client()
         url = "/api/option-trades/flow-alerts"
 
-        # FIX 3: Pass watermark as a query parameter so the API returns only new events.
         params: dict = {}
         if self.watermark is not None:
             params["after"] = self.watermark.isoformat()
@@ -87,6 +102,19 @@ class UWPoller:
         for attempt in range(self.retry_max):
             try:
                 resp = await client.get(url, params=params)
+                if resp.status_code == 429:
+                    # Respect Retry-After header if present
+                    retry_after = int(resp.headers.get("retry-after", "60"))
+                    logger.warning(
+                        "UW API rate limited (429), backing off",
+                        retry_after=retry_after,
+                        attempt=attempt + 1,
+                    )
+                    self.rate_state.update_from_headers(resp.headers)
+                    if attempt < self.retry_max - 1:
+                        await asyncio.sleep(min(retry_after, 120))
+                        continue
+                    return []
                 if resp.status_code >= 500:
                     if attempt < self.retry_max - 1:
                         wait = self.retry_backoff_base ** attempt

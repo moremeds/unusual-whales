@@ -40,8 +40,6 @@ storage:
 logging:
   level: INFO
   format: json
-  file: logs/scanner.log
-  rotation: 10MB
 ops:
   daily_spend_cap_usd: 10.0
   token_rates:
@@ -103,8 +101,6 @@ storage:
 logging:
   level: INFO
   format: json
-  file: logs/scanner.log
-  rotation: 10MB
 ops:
   daily_spend_cap_usd: 10.0
   token_rates: {}

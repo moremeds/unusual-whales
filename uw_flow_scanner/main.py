@@ -20,15 +20,18 @@ logger = structlog.get_logger()
 
 
 def _setup_logging(cfg: AppConfig) -> None:
-    """Configure structlog for JSON output."""
+    """Configure structlog."""
+    renderer = (
+        structlog.dev.ConsoleRenderer()
+        if cfg.logging.format != "json"
+        else structlog.processors.JSONRenderer()
+    )
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
-            structlog.dev.ConsoleRenderer()
-            if cfg.logging.format != "json"
-            else structlog.processors.JSONRenderer(),
+            renderer,
         ],
         logger_factory=structlog.PrintLoggerFactory(),
     )
@@ -56,7 +59,7 @@ def _is_market_open() -> bool:
 class Scanner:
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
-        self.running = True
+        self._stop_event = asyncio.Event()
         self.health_state = HealthState()
 
         # Components
@@ -95,8 +98,40 @@ class Scanner:
 
         # Cooldown state: ticker -> last alert datetime
         self._cooldowns: dict[str, datetime] = {}
-        # FIX 10: Track whether a budget-exhaustion alert has been sent this session
-        self._budget_alert_sent: bool = False
+
+    async def _hydrate_state(self) -> None:
+        """Restore watermark and cooldowns from DB on startup."""
+        watermark = await self.db.async_get_last_poll_watermark()
+        if watermark is not None:
+            self.poller.watermark = watermark
+            logger.info("Restored watermark from DB", watermark=watermark.isoformat())
+
+        # Restore cooldowns for tickers that have recent sent alerts
+        rows = self.db.con.execute(
+            """
+            SELECT fe.ticker, MAX(ss.created_at) as last_alert
+            FROM signal_scores ss
+            JOIN flow_events fe ON fe.id = ss.flow_event_id
+            WHERE ss.alert_status = 'sent'
+            GROUP BY fe.ticker
+            """
+        ).fetchall()
+        for ticker, last_alert in rows:
+            ts = self.db._ensure_utc(last_alert)
+            elapsed = (datetime.now(timezone.utc) - ts).total_seconds()
+            if elapsed < self.cfg.scoring.alert_cooldown_seconds:
+                self._cooldowns[ticker] = ts
+        if self._cooldowns:
+            logger.info("Restored cooldowns from DB", tickers=list(self._cooldowns.keys()))
+
+    @property
+    def running(self) -> bool:
+        return not self._stop_event.is_set()
+
+    @running.setter
+    def running(self, value: bool) -> None:
+        if not value:
+            self._stop_event.set()
 
     def _is_cooled_down(self, ticker: str) -> bool:
         """Check if ticker is in cooldown period."""
@@ -109,7 +144,6 @@ class Scanner:
     async def _process_event(self, event: FlowEvent, semaphore: asyncio.Semaphore) -> None:
         """Score a single event through the tier pipeline."""
         async with semaphore:
-            # FIX 1: insert_flow_event now returns bool — skip scoring if duplicate
             is_new = await self.db.async_insert_flow_event(event)
             if not is_new:
                 logger.debug("Duplicate event skipped", uw_event_id=event.uw_event_id)
@@ -159,6 +193,11 @@ class Scanner:
                 raw_output=t2_result.model_dump(),
             )
 
+            # Skip alert if this was a duplicate score (phantom UUID)
+            if score_id is None:
+                logger.debug("Duplicate score skipped", uw_event_id=event.uw_event_id)
+                return
+
             # Send Discord alert
             success = await self.alerter.send_alert(event, t2_result)
             status = "sent" if success else "failed"
@@ -169,8 +208,8 @@ class Scanner:
 
     async def run_cycle(self) -> None:
         """Execute one poll -> score -> alert cycle."""
-        # FIX 10: Check budget exhaustion before each cycle and send one-time alert
-        if self.spend_tracker.is_budget_exhausted and not self._budget_alert_sent:
+        # Check budget exhaustion (resets daily via SpendTracker._check_reset)
+        if self.spend_tracker.is_budget_exhausted and not self.spend_tracker.budget_alert_sent:
             msg = (
                 f"[UW Flow Scanner] BUDGET EXHAUSTED: daily spend "
                 f"${self.spend_tracker.daily_spend_usd:.4f} >= "
@@ -178,7 +217,7 @@ class Scanner:
                 f"Tier 2 scoring disabled until UTC midnight."
             )
             await self.alerter.send_text(msg)
-            self._budget_alert_sent = True
+            self.spend_tracker.budget_alert_sent = True
             logger.warning(
                 "Budget exhausted alert sent",
                 spend=self.spend_tracker.daily_spend_usd,
@@ -187,9 +226,8 @@ class Scanner:
 
         events = await self.poller.poll()
 
-        # FIX 8: Record poll health state after every poll, even when no events
         self.health_state.record_poll(
-            events_scored=len(events),
+            events_polled=len(events),
             uw_daily_remaining=self.cfg.uw_api.daily_limit - self.poller.rate_state.daily_count,
         )
 
@@ -198,7 +236,17 @@ class Scanner:
 
         semaphore = asyncio.Semaphore(self.cfg.scoring.tier1_concurrency)
         tasks = [self._process_event(event, semaphore) for event in events]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Log any exceptions from individual event processing
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(
+                    "Event processing failed",
+                    event_index=i,
+                    error=str(result),
+                    exc_info=result,
+                )
 
         logger.info(
             "Cycle complete",
@@ -206,8 +254,19 @@ class Scanner:
             spend=f"${self.spend_tracker.daily_spend_usd:.4f}",
         )
 
+    async def _sleep_or_stop(self, seconds: float) -> bool:
+        """Sleep for `seconds` but wake immediately on stop signal. Returns True if stopped."""
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+            return True  # stop was signaled
+        except (TimeoutError, asyncio.TimeoutError):
+            return False  # timeout expired normally
+
     async def run(self) -> None:
         """Main loop: poll at configured interval during market hours."""
+        # Hydrate state from DB before first poll
+        await self._hydrate_state()
+
         if self.cfg.health.enabled:
             await self.health_server.start()
 
@@ -217,7 +276,8 @@ class Scanner:
             while self.running:
                 if self.cfg.scheduler.market_hours_only and not _is_market_open():
                     logger.debug("Market closed, sleeping 60s")
-                    await asyncio.sleep(60)
+                    if await self._sleep_or_stop(60):
+                        break
                     continue
 
                 try:
@@ -226,7 +286,8 @@ class Scanner:
                     logger.error("Cycle error", error=str(e), exc_info=True)
                     self.health_state.mark_degraded(str(e))
 
-                await asyncio.sleep(self.cfg.scheduler.poll_interval_seconds)
+                if await self._sleep_or_stop(self.cfg.scheduler.poll_interval_seconds):
+                    break
         finally:
             await self.shutdown()
 
@@ -255,7 +316,6 @@ def cli() -> None:
 
     scanner = Scanner(cfg)
 
-    # FIX 12: Use asyncio.run() instead of manual event loop creation
     def handle_signal(sig: int, frame) -> None:
         scanner.running = False
 

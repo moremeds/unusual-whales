@@ -27,17 +27,15 @@ class SpendTracker:
         self.daily_cap_usd = daily_cap_usd
         self.token_rates = token_rates
         self.daily_spend_usd: float = 0.0
-        # FIX 6: Use UTC date for daily reset
         self._reset_date: date = datetime.now(timezone.utc).date()
-        self._budget_alert_sent: bool = False
+        self.budget_alert_sent: bool = False
 
     def _check_reset(self) -> None:
-        # FIX 6: Use UTC date, not local date.today()
         today = datetime.now(timezone.utc).date()
         if today != self._reset_date:
             self.daily_spend_usd = 0.0
             self._reset_date = today
-            self._budget_alert_sent = False
+            self.budget_alert_sent = False
 
     def record_usage(self, model: str, input_tokens: int, output_tokens: int) -> None:
         self._check_reset()

@@ -17,15 +17,26 @@ COLORS = {
 }
 
 
+def _truncate(text: str, limit: int) -> str:
+    """Truncate text to fit Discord's field limits, adding ellipsis if cut."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
 def build_embed(event: FlowEvent, result: Tier2Result) -> dict:
     """Build a Discord rich embed from a scored flow event."""
     direction = result.direction
     color = COLORS.get(direction, 0x808080)
 
+    # Discord limits: title=256, field.name=256, field.value=1024
+    conviction_text = "\n".join(f"• {f}" for f in result.conviction_factors[:10]) or "N/A"
+
     return {
-        "title": (
+        "title": _truncate(
             f"{'🟢' if direction == 'bullish' else '🔴' if direction == 'bearish' else '🟡'}"
-            f" {event.ticker} — {direction.upper()} ({result.score}/100)"
+            f" {event.ticker} — {direction.upper()} ({result.score}/100)",
+            256,
         ),
         "color": color,
         "fields": [
@@ -45,10 +56,14 @@ def build_embed(event: FlowEvent, result: Tier2Result) -> dict:
             },
             {
                 "name": "Conviction Factors",
-                "value": "\n".join(f"• {f}" for f in result.conviction_factors) or "N/A",
+                "value": _truncate(conviction_text, 1024),
                 "inline": False,
             },
-            {"name": "Reasoning", "value": result.reasoning[:1024], "inline": False},
+            {
+                "name": "Reasoning",
+                "value": _truncate(result.reasoning, 1024),
+                "inline": False,
+            },
         ],
         "footer": {
             "text": f"UW Flow Scanner | {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}",

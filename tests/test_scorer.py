@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
@@ -60,8 +60,8 @@ def test_spend_tracker_resets_daily(spend_tracker: SpendTracker):
     spend_tracker.record_usage("claude-sonnet-4-6", input_tokens=1_000_000, output_tokens=1_000_000)
     assert spend_tracker.is_budget_exhausted
 
-    # Simulate date change
-    spend_tracker._reset_date = spend_tracker._reset_date.replace(day=1)
+    # Simulate date change — subtract 1 day to guarantee a different date
+    spend_tracker._reset_date -= timedelta(days=1)
     spend_tracker._check_reset()
     assert not spend_tracker.is_budget_exhausted
 

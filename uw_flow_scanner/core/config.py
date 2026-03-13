@@ -57,8 +57,6 @@ class StorageConfig(BaseModel):
 class LoggingConfig(BaseModel):
     level: str = "INFO"
     format: str = "json"
-    file: str = "logs/scanner.log"
-    rotation: str = "10MB"
 
 
 class TokenRate(BaseModel):
@@ -130,16 +128,9 @@ def load_config(config_path: Path | str = "config/config.yaml") -> AppConfig:
             f"DISCORD_WEBHOOK_URL must be a valid HTTPS URL, got: {cfg.discord_webhook_url!r}"
         )
 
-    # Validate storage path writability
+    # Ensure storage directory exists (DuckDB will error naturally if not writable)
     db_parent = Path(cfg.storage.db_path).parent
     if not db_parent.exists():
         db_parent.mkdir(parents=True, exist_ok=True)
-    # Verify we can actually write to the directory
-    test_file = db_parent / ".write_test"
-    try:
-        test_file.touch()
-        test_file.unlink()
-    except OSError as e:
-        raise ValueError(f"DuckDB path parent is not writable: {db_parent}: {e}") from e
 
     return cfg
